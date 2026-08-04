@@ -1,0 +1,39 @@
+[package]
+name = "configurable-cli"
+description = "Reusable XDG YAML configuration, validation, schema, CLI, and MCP mixin for Rust command-line applications"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+readme = "README.md"
+repository = "https://github.com/harryaskham/configurable-cli"
+homepage = "https://github.com/harryaskham/configurable-cli"
+keywords = ["cli", "configuration", "yaml", "schema", "mcp"]
+categories = ["command-line-utilities", "config"]
+publish = false
+
+[lib]
+name = "configurable_cli"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+schemars = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+mcp-cli = { package = "mcp-cli-core", git = "https://github.com/harryaskham/mcp-cli", branch = "main" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
