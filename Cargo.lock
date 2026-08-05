@@ -212,7 +212,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 [[package]]
 name = "mcp-cli-core"
 version = "0.0.1"
-source = "git+https://github.com/harryaskham/mcp-cli?branch=main#81e55235df7d7335d4dc7bd1095131246d157a2a"
+source = "git+https://github.com/harryaskham/mcp-cli?rev=81e55235df7d7335d4dc7bd1095131246d157a2a#81e55235df7d7335d4dc7bd1095131246d157a2a"
 dependencies = [
  "schemars",
  "serde",
