@@ -5,10 +5,11 @@
 //! validation, atomic owner-only writes, schema generation, import/export,
 //! clap subcommands, and matching MCP tools.
 
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::marker::PhantomData;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use clap::{Subcommand, ValueEnum};
 use mcp_cli::{ErrorCategory, StructuredError, ToolRouter};
@@ -168,7 +169,9 @@ impl<C: AppConfig> ConfigManager<C> {
     }
 
     /// Validate before an owner-only atomic replacement. A rejected value never
-    /// changes the destination.
+    /// changes the destination. If `path` is a symlink, the write follows its
+    /// complete chain and atomically replaces the real target without unlinking
+    /// the user-facing symlink.
     pub fn save(&self, path: &Path, config: &C) -> Result<(), ConfigError> {
         config.validate()?;
         let yaml = serde_yaml::to_string(config).map_err(ConfigError::Encode)?;
@@ -306,14 +309,15 @@ fn non_empty_env(key: &str) -> Option<String> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
-    let parent = path
+    let write_target = resolve_write_target(path)?;
+    let parent = write_target
         .parent()
-        .ok_or_else(|| ConfigError::NoParent(path.to_path_buf()))?;
+        .ok_or_else(|| ConfigError::NoParent(write_target.clone()))?;
     fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
         path: parent.to_path_buf(),
         source,
     })?;
-    let temporary = path.with_extension(format!("yaml.{}.tmp", std::process::id()));
+    let temporary = write_target.with_extension(format!("yaml.{}.tmp", std::process::id()));
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true);
     #[cfg(unix)]
@@ -333,11 +337,89 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
             path: temporary.clone(),
             source,
         })?;
-    fs::rename(&temporary, path).map_err(|source| ConfigError::Write {
-        path: path.to_path_buf(),
+    fs::rename(&temporary, &write_target).map_err(|source| ConfigError::Write {
+        path: write_target,
         source,
     })?;
     Ok(())
+}
+
+/// Resolve only the final file's symlink chain. Parent-directory symlinks are
+/// intentionally left to the operating system; the temporary file is still
+/// created in the target's effective directory and the rename stays atomic.
+fn resolve_write_target(path: &Path) -> Result<PathBuf, ConfigError> {
+    const MAX_SYMLINKS: usize = 40;
+
+    let mut current = absolute_path(path)?;
+    let mut seen = HashSet::new();
+    for _ in 0..MAX_SYMLINKS {
+        if !seen.insert(symlink_identity(&current)) {
+            return Err(ConfigError::SymlinkLoop(path.to_path_buf()));
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let link =
+                    fs::read_link(&current).map_err(|source| ConfigError::ResolveSymlink {
+                        path: current.clone(),
+                        source,
+                    })?;
+                current = if link.is_absolute() {
+                    link
+                } else {
+                    let parent = current
+                        .parent()
+                        .ok_or_else(|| ConfigError::NoParent(current.clone()))?;
+                    // Do not lexically collapse `..`: if `parent` itself is a
+                    // symlink, the OS applies `..` after resolving that parent.
+                    parent.join(link)
+                };
+            }
+            Ok(_) => return Ok(current),
+            // A dangling final symlink is valid: saving creates its target.
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(current),
+            Err(source) => {
+                return Err(ConfigError::ResolveSymlink {
+                    path: current,
+                    source,
+                });
+            }
+        }
+    }
+    Err(ConfigError::SymlinkLoop(path.to_path_buf()))
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf, ConfigError> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    let current_dir = std::env::current_dir().map_err(|source| ConfigError::ResolveSymlink {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(current_dir.join(path))
+}
+
+fn symlink_identity(path: &Path) -> PathBuf {
+    path.parent()
+        .and_then(|parent| fs::canonicalize(parent).ok())
+        .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+        .unwrap_or_else(|| lexical_normalize(path))
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
@@ -444,6 +526,14 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    #[error("resolve configuration symlink {path}: {source}")]
+    ResolveSymlink {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("configuration symlink loop while resolving {0}")]
+    SymlinkLoop(PathBuf),
     #[error("configuration path has no parent: {0}")]
     NoParent(PathBuf),
     #[error("configuration already exists: {0} (pass --force to replace)")]
@@ -470,6 +560,8 @@ impl StructuredError for ConfigError {
             | Self::Encode(_)
             | Self::Schema(_)
             | Self::Write { .. }
+            | Self::ResolveSymlink { .. }
+            | Self::SymlinkLoop(_)
             | Self::NoParent(_) => ErrorCategory::ExecutionFailure,
         }
     }
@@ -482,6 +574,7 @@ impl StructuredError for ConfigError {
             Self::Encode(_) => "config_encode",
             Self::Schema(_) => "config_schema",
             Self::Write { .. } | Self::NoParent(_) => "config_write",
+            Self::ResolveSymlink { .. } | Self::SymlinkLoop(_) => "config_symlink",
             Self::Exists(_) => "config_exists",
             Self::ConfirmationRequired => "config_confirmation_required",
         }
@@ -637,6 +730,125 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_follows_relative_config_symlink_without_replacing_it() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tracked = dir.path().join("tracked");
+        let target = tracked.join("config.yaml");
+        let link = dir.path().join("config.yaml");
+        fs::create_dir_all(&tracked).unwrap();
+        fs::write(&target, "enabled: false\nport: 9\n").unwrap();
+        symlink("tracked/config.yaml", &link).unwrap();
+        let link_target = fs::read_link(&link).unwrap();
+
+        let config = TestConfig {
+            enabled: true,
+            port: 42,
+        };
+        manager().save(&link, &config).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), link_target);
+        assert_eq!(manager().load_path(&target).unwrap(), config);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_follows_multi_hop_and_dangling_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let links = dir.path().join("links");
+        let target = dir.path().join("tracked/config.yaml");
+        let first = dir.path().join("config.yaml");
+        let second = links.join("config-link");
+        fs::create_dir_all(&links).unwrap();
+        symlink("links/config-link", &first).unwrap();
+        symlink("../tracked/config.yaml", &second).unwrap();
+
+        let config = TestConfig {
+            enabled: true,
+            port: 43,
+        };
+        manager().save(&first, &config).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&first)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::symlink_metadata(&second)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(manager().load_path(&target).unwrap(), config);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_target_parent_traversal_respects_a_symlinked_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let physical = dir.path().join("physical");
+        let nested = physical.join("nested");
+        let expected_target = physical.join("tracked/config.yaml");
+        let visible_parent = dir.path().join("visible");
+        fs::create_dir_all(&nested).unwrap();
+        symlink("physical/nested", &visible_parent).unwrap();
+        symlink("../tracked/config.yaml", nested.join("config-link")).unwrap();
+
+        let config = TestConfig {
+            enabled: true,
+            port: 44,
+        };
+        manager()
+            .save(&visible_parent.join("config-link"), &config)
+            .unwrap();
+
+        assert_eq!(manager().load_path(&expected_target).unwrap(), config);
+        assert!(!dir.path().join("tracked/config.yaml").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_rejects_a_symlink_loop_without_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("config.yaml");
+        let second = dir.path().join("other.yaml");
+        symlink("other.yaml", &first).unwrap();
+        symlink("config.yaml", &second).unwrap();
+
+        let error = manager()
+            .save(
+                &first,
+                &TestConfig {
+                    enabled: true,
+                    port: 44,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, ConfigError::SymlinkLoop(path) if path == first));
+        assert_eq!(fs::read_link(&first).unwrap(), PathBuf::from("other.yaml"));
+        assert_eq!(
+            fs::read_link(&second).unwrap(),
+            PathBuf::from("config.yaml")
+        );
     }
 
     #[derive(Debug, Parser)]

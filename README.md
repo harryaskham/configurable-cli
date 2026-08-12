@@ -9,7 +9,8 @@ A host provides one serde/schemars type and a small `ConfigSpec`.
 - path precedence: explicit CLI path, `$APP_CONFIG`, `$XDG_CONFIG_HOME`, `$HOME`;
 - defaults for absent/empty/partial files;
 - semantic validation through `AppConfig::validate`;
-- owner-only (`0600`) atomic writes;
+- owner-only (`0600`) atomic writes that follow relative or multi-hop config
+  symlinks and replace the real target without unlinking the symlink;
 - validate-before-write import and fully-defaulted export;
 - generated JSON Schema;
 - reusable clap `config` subcommands;
