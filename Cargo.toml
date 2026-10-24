@@ -22,6 +22,7 @@ schemars = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+sha2 = "0.10"
 thiserror = "2"
 mcp-cli = { package = "mcp-cli-core", git = "https://github.com/harryaskham/mcp-cli", rev = "81e55235df7d7335d4dc7bd1095131246d157a2a" }
 
