@@ -17,6 +17,28 @@ A host provides one serde/schemars type and a small `ConfigSpec`.
 - matching `config_status`, `config_validate`, `config_schema`, and
   confirmation-gated `config_init` MCP tools.
 
+## JSON and shared files
+
+A file name ending in `.json` (or `ConfigSpec::with_format(ConfigFormat::Json)`)
+reads and writes pretty JSON instead of YAML. For a file that another program
+also owns, `ConfigSpec::preserving_unknown_keys()` merges each save into the
+existing document: top-level keys the host type declares are replaced, or
+removed when the host no longer serializes them, and every other key is kept
+exactly. A document that does not parse is never overwritten.
+
+`Loaded::revision` is a `sha256:` digest of the bytes that were read.
+`ConfigManager::save_if_revision(path, config, revision)` refuses with
+`ConfigError::Conflict` if another writer changed the file since then (`None`
+means the file must not exist yet).
+
+```rust,ignore
+let manager = ConfigManager::<Namespaces>::new(
+    ConfigSpec::new("tyler").with_file_name("config.json").preserving_unknown_keys(),
+);
+let loaded = manager.load(None)?;
+manager.save_if_revision(&loaded.path, &edited, loaded.revision.as_deref())?;
+```
+
 ## Host integration
 
 ```rust

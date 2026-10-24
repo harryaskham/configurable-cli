@@ -4,6 +4,12 @@
 //! The crate then owns path precedence, absent-file defaults, semantic
 //! validation, atomic owner-only writes, schema generation, import/export,
 //! clap subcommands, and matching MCP tools.
+//!
+//! YAML is the default format. A spec whose file name ends in `.json` (or that
+//! calls [`ConfigSpec::with_format`]) reads and writes JSON instead. With
+//! [`ConfigSpec::preserving_unknown_keys`], saves merge into the existing
+//! document so a config file shared with another program keeps the top-level
+//! namespaces this host does not own.
 
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
@@ -30,12 +36,42 @@ pub trait AppConfig:
     }
 }
 
+/// On-disk encoding of the configuration file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigFormat {
+    #[default]
+    Yaml,
+    Json,
+}
+
+impl ConfigFormat {
+    /// `.json` selects JSON and `.yaml`/`.yml` YAML; anything else is unknown.
+    #[must_use]
+    pub fn from_path(path: &Path) -> Option<Self> {
+        match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("json") => Some(Self::Json),
+            Some("yaml" | "yml") => Some(Self::Yaml),
+            _ => None,
+        }
+    }
+}
+
 /// Stable host metadata used for path resolution and diagnostics.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigSpec {
     pub app_name: String,
     pub env_var: String,
     pub file_name: String,
+    pub format: ConfigFormat,
+    /// Merge saves into the existing document instead of replacing it, keeping
+    /// top-level keys the host's type does not declare.
+    pub preserve_unknown_keys: bool,
 }
 
 impl ConfigSpec {
@@ -57,6 +93,8 @@ impl ConfigSpec {
             app_name,
             env_var,
             file_name: "config.yaml".into(),
+            format: ConfigFormat::Yaml,
+            preserve_unknown_keys: false,
         }
     }
 
@@ -66,9 +104,26 @@ impl ConfigSpec {
         self
     }
 
+    /// Set the file name; a `.json`/`.yaml`/`.yml` extension also selects the format.
     #[must_use]
     pub fn with_file_name(mut self, file_name: impl Into<String>) -> Self {
         self.file_name = file_name.into();
+        if let Some(format) = ConfigFormat::from_path(Path::new(&self.file_name)) {
+            self.format = format;
+        }
+        self
+    }
+
+    #[must_use]
+    pub const fn with_format(mut self, format: ConfigFormat) -> Self {
+        self.format = format;
+        self
+    }
+
+    /// Keep top-level keys this host does not own when saving (shared files).
+    #[must_use]
+    pub const fn preserving_unknown_keys(mut self) -> Self {
+        self.preserve_unknown_keys = true;
         self
     }
 }
@@ -79,6 +134,9 @@ pub struct Loaded<C> {
     pub path: PathBuf,
     pub existed: bool,
     pub config: C,
+    /// `sha256:<hex>` of the bytes read, or `None` when the file was absent.
+    /// Pass it to [`ConfigManager::save_if_revision`] to detect concurrent edits.
+    pub revision: Option<String>,
 }
 
 /// Reusable configuration manager.
@@ -134,27 +192,58 @@ impl<C: AppConfig> ConfigManager<C> {
         let config = if text.trim().is_empty() {
             C::default()
         } else {
-            serde_yaml::from_str(text).map_err(|source| ConfigError::Parse {
-                app: self.spec.app_name.clone(),
-                source,
-            })?
+            self.decode::<C>(text)?
         };
         config.validate()?;
         Ok(config)
     }
 
+    fn decode<T: DeserializeOwned>(&self, text: &str) -> Result<T, ConfigError> {
+        match self.spec.format {
+            ConfigFormat::Yaml => serde_yaml::from_str(text).map_err(|source| ConfigError::Parse {
+                app: self.spec.app_name.clone(),
+                source,
+            }),
+            ConfigFormat::Json => {
+                serde_json::from_str(text).map_err(|source| ConfigError::ParseJson {
+                    app: self.spec.app_name.clone(),
+                    source,
+                })
+            }
+        }
+    }
+
+    /// Serialize a value in the configured format (JSON is pretty-printed with a
+    /// trailing newline).
+    pub fn encode<T: Serialize>(&self, value: &T) -> Result<String, ConfigError> {
+        match self.spec.format {
+            ConfigFormat::Yaml => serde_yaml::to_string(value).map_err(ConfigError::Encode),
+            ConfigFormat::Json => serde_json::to_string_pretty(value)
+                .map(|text| text + "\n")
+                .map_err(ConfigError::EncodeJson),
+        }
+    }
+
     pub fn load(&self, explicit: Option<&Path>) -> Result<Loaded<C>, ConfigError> {
         let path = self.resolve_path(explicit);
-        match fs::read_to_string(&path) {
-            Ok(text) => Ok(Loaded {
-                path,
-                existed: true,
-                config: self.parse(&text)?,
-            }),
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let text = String::from_utf8(bytes.clone()).map_err(|error| ConfigError::Read {
+                    path: path.clone(),
+                    source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                })?;
+                Ok(Loaded {
+                    path,
+                    existed: true,
+                    config: self.parse(&text)?,
+                    revision: Some(revision(&bytes)),
+                })
+            }
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Loaded {
                 path,
                 existed: false,
                 config: C::default(),
+                revision: None,
             }),
             Err(source) => Err(ConfigError::Read { path, source }),
         }
@@ -174,8 +263,67 @@ impl<C: AppConfig> ConfigManager<C> {
     /// the user-facing symlink.
     pub fn save(&self, path: &Path, config: &C) -> Result<(), ConfigError> {
         config.validate()?;
-        let yaml = serde_yaml::to_string(config).map_err(ConfigError::Encode)?;
-        atomic_write(path, yaml.as_bytes())
+        let body = self.document(path, config)?;
+        atomic_write(path, body.as_bytes())
+    }
+
+    /// Like [`save`](Self::save), but refuses with [`ConfigError::Conflict`]
+    /// when the file no longer has the revision it was loaded at (`None` means
+    /// "must not exist"). Detects edits that completed since the load; the
+    /// rename itself is atomic.
+    pub fn save_if_revision(
+        &self,
+        path: &Path,
+        config: &C,
+        expected: Option<&str>,
+    ) -> Result<(), ConfigError> {
+        let current = match fs::read(path) {
+            Ok(bytes) => Some(revision(&bytes)),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        if current.as_deref() != expected {
+            return Err(ConfigError::Conflict(path.to_path_buf()));
+        }
+        self.save(path, config)
+    }
+
+    /// The bytes a save would write. With `preserve_unknown_keys`, keys the host
+    /// type declares are replaced (or removed when it no longer serializes them)
+    /// and every other top-level key of the existing document is kept.
+    fn document(&self, path: &Path, config: &C) -> Result<String, ConfigError> {
+        if !self.spec.preserve_unknown_keys {
+            return self.encode(config);
+        }
+        let fresh = serde_json::to_value(config).map_err(ConfigError::Schema)?;
+        let existing = match fs::read_to_string(path) {
+            Ok(text) if !text.trim().is_empty() => Some(self.decode::<serde_json::Value>(&text)?),
+            Ok(_) => None,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        match (existing, fresh) {
+            (Some(serde_json::Value::Object(mut document)), serde_json::Value::Object(owned)) => {
+                for key in declared_keys::<C>() {
+                    if !owned.contains_key(&key) {
+                        document.remove(&key);
+                    }
+                }
+                document.extend(owned);
+                self.encode(&serde_json::Value::Object(document))
+            }
+            (_, fresh) => self.encode(&fresh),
+        }
     }
 
     pub fn init(&self, path: &Path, force: bool) -> Result<C, ConfigError> {
@@ -209,6 +357,12 @@ impl<C: AppConfig> ConfigManager<C> {
         serde_yaml::to_string(&loaded.config).map_err(ConfigError::Encode)
     }
 
+    /// Export the resolved configuration in the configured format.
+    pub fn export(&self, explicit: Option<&Path>) -> Result<String, ConfigError> {
+        let loaded = self.load(explicit)?;
+        self.encode(&loaded.config)
+    }
+
     pub fn status(&self, explicit: Option<&Path>) -> Result<ConfigStatus, ConfigError> {
         let loaded = self.load(explicit)?;
         Ok(ConfigStatus {
@@ -229,9 +383,9 @@ impl<C: AppConfig> ConfigManager<C> {
         match command {
             ConfigCommand::Show => {
                 let loaded = self.load(Some(&destination))?;
-                let yaml = serde_yaml::to_string(&loaded.config).map_err(ConfigError::Encode)?;
+                let body = self.encode(&loaded.config)?;
                 Ok(ConfigCommandOutput::new(
-                    yaml.clone(),
+                    body,
                     serde_json::to_value(&loaded.config).map_err(ConfigError::Schema)?,
                 ))
             }
@@ -277,7 +431,8 @@ impl<C: AppConfig> ConfigManager<C> {
                 Ok(ConfigCommandOutput::new(format!("{body}\n"), value))
             }
             ConfigCommand::Export { output } => {
-                let body = self.export_yaml(Some(&destination))?;
+                let loaded = self.load(Some(&destination))?;
+                let body = self.encode(&loaded.config)?;
                 if let Some(path) = output {
                     atomic_write(&path, body.as_bytes())?;
                     Ok(ConfigCommandOutput::new(
@@ -285,11 +440,8 @@ impl<C: AppConfig> ConfigManager<C> {
                         serde_json::json!({"exported": true, "path": path}),
                     ))
                 } else {
-                    let value: serde_json::Value =
-                        serde_yaml::from_str(&body).map_err(|source| ConfigError::Parse {
-                            app: self.spec.app_name.clone(),
-                            source,
-                        })?;
+                    let value =
+                        serde_json::to_value(&loaded.config).map_err(ConfigError::Schema)?;
                     Ok(ConfigCommandOutput::new(body, value))
                 }
             }
@@ -302,6 +454,29 @@ impl<C: AppConfig> ConfigManager<C> {
             }
         }
     }
+}
+
+/// Top-level properties the host type declares in its JSON Schema.
+fn declared_keys<C: JsonSchema>() -> Vec<String> {
+    serde_json::to_value(schema_for!(C))
+        .ok()
+        .and_then(|schema| {
+            schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .map(|p| p.keys().cloned().collect())
+        })
+        .unwrap_or_default()
+}
+
+fn revision(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let mut text = String::from("sha256:");
+    for byte in Sha256::digest(bytes) {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
 }
 
 fn non_empty_env(key: &str) -> Option<String> {
@@ -317,7 +492,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
         path: parent.to_path_buf(),
         source,
     })?;
-    let temporary = write_target.with_extension(format!("yaml.{}.tmp", std::process::id()));
+    let name = write_target
+        .file_name()
+        .map_or_else(|| "config".into(), |n| n.to_string_lossy().into_owned());
+    let temporary = write_target.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true);
     #[cfg(unix)]
@@ -514,10 +692,20 @@ pub enum ConfigError {
         #[source]
         source: serde_yaml::Error,
     },
+    #[error("parse {app} configuration: {source}")]
+    ParseJson {
+        app: String,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("configuration validation failed: {0}")]
     Validation(String),
     #[error("serialize configuration: {0}")]
     Encode(serde_yaml::Error),
+    #[error("serialize configuration: {0}")]
+    EncodeJson(serde_json::Error),
+    #[error("configuration changed since it was loaded: {0}")]
+    Conflict(PathBuf),
     #[error("serialize configuration schema: {0}")]
     Schema(serde_json::Error),
     #[error("write configuration {path}: {source}")]
@@ -552,12 +740,14 @@ impl ConfigError {
 impl StructuredError for ConfigError {
     fn category(&self) -> ErrorCategory {
         match self {
-            Self::Parse { .. } | Self::Validation(_) | Self::ConfirmationRequired => {
-                ErrorCategory::Validation
-            }
-            Self::Exists(_) => ErrorCategory::ConfigError,
+            Self::Parse { .. }
+            | Self::ParseJson { .. }
+            | Self::Validation(_)
+            | Self::ConfirmationRequired => ErrorCategory::Validation,
+            Self::Exists(_) | Self::Conflict(_) => ErrorCategory::ConfigError,
             Self::Read { .. }
             | Self::Encode(_)
+            | Self::EncodeJson(_)
             | Self::Schema(_)
             | Self::Write { .. }
             | Self::ResolveSymlink { .. }
@@ -569,9 +759,10 @@ impl StructuredError for ConfigError {
     fn code(&self) -> String {
         match self {
             Self::Read { .. } => "config_read",
-            Self::Parse { .. } => "config_parse",
+            Self::Parse { .. } | Self::ParseJson { .. } => "config_parse",
+            Self::Conflict(_) => "config_conflict",
             Self::Validation(_) => "config_validation",
-            Self::Encode(_) => "config_encode",
+            Self::Encode(_) | Self::EncodeJson(_) => "config_encode",
             Self::Schema(_) => "config_schema",
             Self::Write { .. } | Self::NoParent(_) => "config_write",
             Self::ResolveSymlink { .. } | Self::SymlinkLoop(_) => "config_symlink",
