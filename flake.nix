@@ -14,7 +14,7 @@
     flake-utils.lib.eachDefaultSystem (
       system:
       let
-        pkgs = import nixpkgs { inherit system; };
+        pkgs = nixpkgs.legacyPackages.${system};
         cargoConfig = pkgs.writeText "configurable-cli-cargo-config.toml" ''
           [patch."https://github.com/harryaskham/mcp-cli"]
           mcp-cli-core = { path = "${mcp-cli}" }
